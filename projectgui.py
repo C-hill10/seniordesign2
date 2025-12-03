@@ -5,6 +5,8 @@ import pynmea2
 from threading import Thread, Event
 from usbmonitor import USBMonitor
 from usbmonitor.attributes import ID_MODEL, ID_MODEL_ID, ID_VENDOR_ID
+
+#Boolean for USB state and GPS data reading state
 USB_Found = True
 
 port = "COM3"
@@ -127,6 +129,10 @@ def serial_reader_thread(window, stop_event: Event):
     Collects telemetry fields (lat, lon, accel, gyro, mag) until it has a complete set, then sends.
     """
     ser = None
+    # Track whether last parsed NMEA indicates a valid GPS fix
+    gps_has_fix = False
+    # Make sure to update globals we write to
+    global USB_Found, running
     accumulated_data = {}  # Accumulates telemetry fields from multiple lines
     try:
         ser = serial.Serial(port, baudrate, timeout=0.1)
@@ -137,13 +143,14 @@ def serial_reader_thread(window, stop_event: Event):
             # If the window doesn't have a thread queue (closed), stop the thread
             USB_Found = False
             running = False
+           
             USB_Status = 'No USB Device Found'
             window[USBKEY].update('No USB Device Found')
             window['-STARTSTOP-'].update(disabled=True)
             return
         
         consecutive_errors = 0
-        max_consecutive_errors = 5
+        max_consecutive_errors = 3
         
         while True:
             # Check if the main thread requested stop
@@ -177,11 +184,9 @@ def serial_reader_thread(window, stop_event: Event):
                             pass
                     except Exception as reconnect_err:
                         print(f"Reconnect failed: {reconnect_err}")
-                        USB_Found = False
-                        running = False
                         USB_Status = 'No USB Device Found'
-                        window[USBKEY].update('No USB Device Found')
                         window['-STARTSTOP-'].update(disabled=True)
+                        
                         break
                 time.sleep(0.1)
                 raw = b''
@@ -191,8 +196,6 @@ def serial_reader_thread(window, stop_event: Event):
                 if consecutive_errors >= max_consecutive_errors:
                     USB_Found = False
                     running = False
-                    window[USBKEY].update('No USB Device Found')
-                    window['-STARTSTOP-'].update(disabled=True)
                     break
                 time.sleep(0.1)
                 raw = b''
@@ -214,16 +217,20 @@ def serial_reader_thread(window, stop_event: Event):
             parsed = parse_telemetry_line(line)
             if parsed:
                 accumulated_data.update(parsed)
-                # If we now have both lat and lon, send the accumulated data to GUI
-                if 'latitude' in accumulated_data and 'longitude' in accumulated_data:
-                    accumulated_data['status'] = f"Data Received at {time.strftime('%H:%M:%S')}"
-                    accumulated_data['raw'] = line
+                # Update status if GPS has a fix (NMEA parsing updates gps_has_fix)
+                if gps_has_fix:
                     try:
-                        window.write_event_value(THREAD_MESSAGE_KEY, accumulated_data.copy())
+                        window[USBKEY].update('GPS Fixed, data will now update')
                     except Exception:
-                        break
+                        pass
+                accumulated_data['status'] = f"Data Received at {time.strftime('%H:%M:%S')}"
+                accumulated_data['raw'] = line
+                try:
+                    window.write_event_value(THREAD_MESSAGE_KEY, accumulated_data.copy())
+                except Exception:
+                    break
                     # Clear for next batch
-                    accumulated_data = {}
+                accumulated_data = {}
             # Also handle standard NMEA sentences (in case device ever sends them)
             elif line and line.startswith('$G'):
                 try:
@@ -239,13 +246,14 @@ def serial_reader_thread(window, stop_event: Event):
 
                         lat_str = ''
                         lon_str = ''
-                        has_fix = False
+                        # Update our internal GPS fix status
+                        gps_has_fix = False
                         try:
                             if lat is not None:
                                 latf = float(lat)
                                 if latf != 0.0:
                                     lat_str = f"{latf:.6f} {lat_dir}"
-                                    has_fix = True
+                                    gps_has_fix = True
                             if lon is not None:
                                 lonf = float(lon)
                                 lon_str = f"{lonf:.6f} {lon_dir}"
@@ -254,7 +262,7 @@ def serial_reader_thread(window, stop_event: Event):
                             lat_str = str(lat) if lat is not None else ''
                             lon_str = str(lon) if lon is not None else ''
 
-                        if has_fix:
+                        if gps_has_fix:
                             data = {
                                 'latitude': lat_str,
                                 'longitude': lon_str,
@@ -288,9 +296,11 @@ def serial_reader_thread(window, stop_event: Event):
             # If window not available, just print and exit
             USB_Found = False
             running = False
-            window[USBKEY].update('No USB Device Found')
+            USB_Status = 'No USB Device Found'
+            window[USBKEY].update(USB_Status)
             window['-STARTSTOP-'].update(disabled=True)            
             print(f"ERROR: Could not open port {port}. ({e})")
+            
             
     except Exception as e:
         print(f"Thread Error: {e}")
@@ -300,8 +310,6 @@ def serial_reader_thread(window, stop_event: Event):
             ser.close()
         USB_Found = False
         running = False
-        window[USBKEY].update('No USB Device Found')
-        window['-STARTSTOP-'].update(disabled=True)       
 sg.theme('Dark Green 7')
 
 # Define keys for output values
@@ -383,8 +391,28 @@ stop_event = Event()
 serial_thread = Thread(target=serial_reader_thread, args=(window, stop_event), daemon=True)
 serial_thread.start()
 
-on_connect = lambda device_id, device_info: print(f"Connected: {device_info_str(device_info=device_info)}"); USB_Found = True; 
-on_disconnect = lambda device_id, device_info: print(f"Disconnected: {device_info_str(device_info=device_info)}"); USB_Found = False;  running = False;
+def on_connect(device_id, device_info):
+    """Callback invoked by USB monitor thread when a device connects."""
+    global USB_Found
+    USB_Found = True
+    print(f"Connected: {device_info_str(device_info=device_info)}")
+    try:
+        # Notify main loop that a device has connected
+        window.write_event_value(THREAD_MESSAGE_KEY, {'status': f"Connected: {device_info_str(device_info=device_info)}"})
+    except Exception:
+        pass
+
+def on_disconnect(device_id, device_info):
+    """Callback invoked by USB monitor thread when a device disconnects."""
+    global USB_Found, running
+    USB_Found = False
+    running = False
+    print(f"Disconnected: {device_info_str(device_info=device_info)}")
+    try:
+        # Notify main loop that the device has been disconnected
+        window.write_event_value(THREAD_MESSAGE_KEY, {'status': f"Disconnected: {device_info_str(device_info=device_info)}"})
+    except Exception:
+        pass
 monitor = USBMonitor()
 
 # Start the daemon
@@ -408,10 +436,10 @@ while True:
 
     if event == THREAD_MESSAGE_KEY:
         message = values[THREAD_MESSAGE_KEY]
-        # Only update GUI fields if 'Start' button is pressed (running == True)
+        # Update GUI telemetry fields only when running (Start pressed). Status updates always update.
         if running == True:
+            # Update GPS position elements if present in message
             if 'latitude' in message:
-            # Update GPS data elements
                 window[LATKEY].update(message['latitude'])
             if 'longitude' in message:
                 window[LONGKEY].update(message['longitude'])
